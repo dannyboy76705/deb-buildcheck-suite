@@ -5,7 +5,7 @@ autoconf/automake after running ./configure) to find what it actually
 links against, what programs it invokes, and what pkg-config modules it
 queries - then map each to a Debian package and check install status.
 
-Part of the buildcheck suite. Shares its package/program/library
+Part of deb-buildcheck-suite. Shares its package/program/library
 resolution with configcheck.py (must be in the same directory).
 
 Usage: ./makecheck.py /path/to/Makefile [--json] [-o FILE]
@@ -176,6 +176,11 @@ LIB_FLAG_RE = re.compile(r'(?<![A-Za-z0-9_-])-l([A-Za-z0-9_+]+)')
 FIND_FLAG_FALSE_POSITIVES = {"inks", "name", "inux", "ink"}
 INCLUDE_FLAG_RE = re.compile(r'-I\s*(\S+)')
 PKGCONFIG_CALL_RE = re.compile(r'\bpkg-config\b([^`)\n]*)')
+# a captured call's text can run on past pkg-config's own arguments into
+# a chained shell command - e.g. "pkg-config --exists 'foo' && echo yes
+# || echo no" - without truncating there, "echo"/"yes"/"no" get picked
+# up as if they were bare module names
+CALL_CHAIN_SPLIT_RE = re.compile(r'&&|\|\||;|\|')
 PKGCONFIG_ARG_RE = re.compile(r'(?<!\S)([A-Za-z][A-Za-z0-9+._-]*(?:>=?[0-9.]+)?)')
 # --atleast-version=1.2.3 foo (also --exact-version=/--max-version=) - the
 # version and the module name appear as two separate CLI args rather than
@@ -261,7 +266,9 @@ def extract_pkgconfig_modules(blob: str) -> "dict[str, VersionReq | None]":
     module with no version constraint)."""
     modules: "dict[str, VersionReq | None]" = {}
 
-    for call in PKGCONFIG_CALL_RE.findall(blob):
+    for raw_call in PKGCONFIG_CALL_RE.findall(blob):
+        call = CALL_CHAIN_SPLIT_RE.split(raw_call, maxsplit=1)[0]
+
         # inline "mod >= 1.2.3" specs, e.g. pkg-config --exists 'foo >= 1.2'
         for m in MODVER_TOKEN_RE.finditer(call):
             mod, op, ver = m.groups()
@@ -274,7 +281,7 @@ def extract_pkgconfig_modules(blob: str) -> "dict[str, VersionReq | None]":
             op = VERSIONFLAG_OP[fm.group(1)]
             ver = fm.group(2)
             for tok in call.split():
-                tok = tok.rstrip(")}'\"")
+                tok = tok.strip("()}{'\"")
                 if not tok or tok.startswith("-") or "=" in tok or tok == "pkg-config":
                     continue
                 if PKGCONFIG_ARG_RE.fullmatch(tok) and tok not in modules:
@@ -286,7 +293,7 @@ def extract_pkgconfig_modules(blob: str) -> "dict[str, VersionReq | None]":
         # ordinary token when a line invokes it more than once (e.g.
         # "pkg-config --exists foo && pkg-config --cflags foo")
         for tok in call.split():
-            tok = tok.rstrip(")}'\"")
+            tok = tok.strip("()}{'\"")
             if not tok or tok.startswith("-") or tok == "pkg-config":
                 continue
             if PKGCONFIG_ARG_RE.fullmatch(tok) and tok not in modules:
@@ -306,13 +313,24 @@ def extract_programs(recipes: list[str], values: dict[str, str]) -> list[str]:
         if first and "$" not in first:
             programs.add(first)
 
+    REDIRECT_TOKEN_RE = re.compile(r'^[0-9]*(>>?|<)&?[0-9]*\S*$')
+
     for recipe in recipes:
         line = expand(recipe, values).strip()
-        line = line.lstrip("@-+(").strip()  # Make's per-recipe echo/error/job-server prefixes,
-                                             # plus a leading subshell-opening '('
+        line = line.lstrip("@-+({").strip()  # Make's per-recipe echo/error/job-server prefixes,
+                                              # plus a leading subshell-opening '(' or a POSIX
+                                              # shell brace-group opener '{' - neither is ever
+                                              # itself the command being run
         if not line:
             continue
-        first = line.split()[0]
+        tokens = line.split()
+        # a redirection can legally appear as a prefix before the actual
+        # command word in POSIX shell (e.g. "{ >&2 echo ...; }") - skip
+        # past any leading redirection-shaped tokens to find the real one
+        tokens = [t for t in tokens if not REDIRECT_TOKEN_RE.match(t)]
+        if not tokens:
+            continue
+        first = tokens[0]
         # a relative path (contains '/' but isn't rooted at '/') almost
         # always points at something the project just built or a script
         # living in its own tree (e.g. "frontend/mp3x$(EXEEXT)") - not a

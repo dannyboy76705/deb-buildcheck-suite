@@ -7,7 +7,7 @@ exercise a particular code path (a conditionally dlopen()'d plugin, an
 optional backend) that a static build-time scan (configcheck.py /
 makecheck.py) can never see.
 
-Part of the buildcheck suite. Shares its rendering and subprocess
+Part of deb-buildcheck-suite. Shares its rendering and subprocess
 helpers with configcheck.py (must be in the same directory).
 
 Usage: ./runcheck.py <program> [args...]

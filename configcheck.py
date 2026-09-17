@@ -5,7 +5,7 @@ running it) to list mandatory and optional build checks, what each checks
 for, which Debian package provides it, and whether that package is
 installed.
 
-Part of the buildcheck suite (see also makecheck.py).
+Part of deb-buildcheck-suite (see also makecheck.py).
 
 Usage: ./configcheck.py /path/to/configure [--json]
 """
@@ -765,7 +765,7 @@ def _format_ambiguous(pkgs: list[str], max_chars: int = 32) -> str:
 # it has data to work with, falling through to apt-file (if present) only
 # when no Contents file can be found at all.
 # ---------------------------------------------------------------------------
-CONTENTS_ENV_VAR = "BUILDCHECK_CONTENTS_FILE"
+CONTENTS_ENV_VAR = "DEB_BUILDCHECK_CONTENTS_FILE"
 # newest apt (Debian ~bullseye+/Trixie, integrated straight into the main
 # list cache) through classic apt-file's own separate cache directory
 CONTENTS_SEARCH_DIRS = (
@@ -776,7 +776,7 @@ CONTENTS_SEARCH_DIRS = (
 
 
 def _find_contents_files() -> list:
-    """An explicit BUILDCHECK_CONTENTS_FILE env var (one path, or several
+    """An explicit DEB_BUILDCHECK_CONTENTS_FILE env var (one path, or several
     joined with ':') always wins and skips the directory scan - useful
     when the relevant Contents file was fetched on a different machine
     and dropped in an arbitrary location, exactly like tonight's case."""
@@ -930,7 +930,7 @@ def describe_contents_files() -> str:
     at a glance which ones are actually in play without this."""
     files = _contents_files()
     if not files:
-        return ("No local Contents files found (checked $BUILDCHECK_CONTENTS_FILE, "
+        return ("No local Contents files found (checked $DEB_BUILDCHECK_CONTENTS_FILE, "
                  "/var/lib/apt/lists, /var/cache/apt/apt-file, ~/.cache/apt-file) - "
                  "lookups for anything not already installed will rely on 'apt-file "
                  "search' if it's installed, or show '?' otherwise.")

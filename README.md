@@ -1,4 +1,4 @@
-# buildcheck
+# deb-buildcheck-suite
 
 A small suite of Debian CLI tools that answer one question: **what do I
 need to install to build (and run) this software, and what's the exact
@@ -6,10 +6,10 @@ Debian package for that?**
 
 Autotools-based projects assume you already know that `curses not found`
 means `libncurses-dev`, that `-lz` means `zlib1g-dev`, and that a stray
-`libmagic.h` check might resolve to three different packages depending on
-what else you have installed. buildcheck does that translation for you -
-statically, before you ever run `./configure` or `make` for real, and
-dynamically, by watching a program actually run.
+`libmagic.h` check might resolve to three different packages depending
+on what else you have installed. deb-buildcheck-suite does that
+translation for you - statically, before you ever run `./configure` or
+`make` for real, and dynamically, by watching a program actually run.
 
 The suite is geared specifically toward **GNU autotools** projects
 (`configure` + Makefiles). CMake and Meson support is planned - see
@@ -192,12 +192,13 @@ isn't already installed:
 1. **`dpkg -S`** - is it already installed right now
 2. **A Contents file, parsed directly** - Debian publishes a full index
    of every file in every package (`Contents-<arch>`, optionally
-   `.gz`/`.lz4`-compressed) for exactly this purpose. buildcheck reads
-   these itself rather than shelling out to a separate tool, so it works
-   even where that tool doesn't (see below). Auto-discovered from
-   `/var/lib/apt/lists`, `/var/cache/apt/apt-file`, or
-   `~/.cache/apt-file`; or point it at specific files directly with
-   `BUILDCHECK_CONTENTS_FILE=/path/to/file1:/path/to/file2`. All three
+   `.gz`/`.lz4`-compressed) for exactly this purpose.
+   deb-buildcheck-suite reads these itself rather than shelling out to
+   a separate tool, so it works even where that tool doesn't (see
+   below). Auto-discovered from `/var/lib/apt/lists`,
+   `/var/cache/apt/apt-file`, or `~/.cache/apt-file`; or point it at
+   specific files directly with
+   `DEB_BUILDCHECK_CONTENTS_FILE=/path/to/file1:/path/to/file2`. All three
    tools print which files they found (or that none were found) before
    they start
 3. **`apt-file search`**, if installed - a last-resort fallback; in
