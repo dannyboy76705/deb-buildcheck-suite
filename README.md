@@ -4,29 +4,49 @@ A small suite of Debian CLI tools that answer one question: **what do I
 need to install to build (and run) this software, and what's the exact
 Debian package for that?**
 
-Autotools-based projects assume you already know that `curses not found`
-means `libncurses-dev`, that `-lz` means `zlib1g-dev`, and that a stray
+Build systems assume you already know that `curses not found` means
+`libncurses-dev`, that `-lz` means `zlib1g-dev`, and that a stray
 `libmagic.h` check might resolve to three different packages depending
 on what else you have installed. deb-buildcheck-suite does that
-translation for you - statically, before you ever run `./configure` or
-`make` for real, and dynamically, by watching a program actually run.
+translation for you - statically, before you ever run `./configure`,
+`cmake` or `meson setup` for real, and dynamically, by watching a program
+actually run.
 
-The suite is geared specifically toward **GNU autotools** projects
-(`configure` + Makefiles). CMake and Meson support is planned - see
-[Roadmap](#roadmap).
+It covers the three build systems you're likely to meet - **GNU
+autotools**, **CMake** and **Meson** - each with a static tool that reads
+the project's sources and a second tool that reads what a configured build
+actually decided. The suite is feature complete; see [Roadmap](#roadmap).
 
 ## Tools
 
-| Tool | Reads | Answers |
+| | Reads the source (nothing to configure first) | Reads a configured build |
 |---|---|---|
-| `configcheck.py` | a generated `configure` script | What does this project check for, mandatory and optional, and do I have it? |
-| `makecheck.py` | a Makefile (hand-written or generated) | What does the concrete build recipe actually link against, invoke, and query via pkg-config? |
-| `runcheck.py` | a running program | What shared libraries/packages does this actually load at runtime - including ones only touched once you exercise a particular code path? |
+| **autotools** | `configcheck.py` - a generated `configure` script | `makecheck.py` - a Makefile (hand-written or generated) |
+| **CMake** | `configcheck-cmake.py` - a `CMakeLists.txt` tree | `makecheck-cmake.py` - a configured build directory |
+| **Meson** | `configcheck-meson.py` - a `meson.build` tree | `makecheck-meson.py` - a configured build directory |
+| **any** | `runcheck.py` - a running program | |
 
-`makecheck.py` and `runcheck.py` both import shared resolution logic
-from `configcheck.py`, so keep all three files in the same directory
-(they don't need to be in your working directory - just next to each
-other).
+- **configcheck-\*** answer: *what does this project check for, mandatory
+  and optional, which Debian package provides each, and do I have it?*
+  Optional checks are grouped under the option that gates them
+  (`--enable-x`, `-DNAME`, `-Dname`); the CMake and Meson reports end with
+  how to flip an option.
+- **makecheck-\*** answer: *what did the build actually link against,
+  invoke and look up - and what came up NOT FOUND, with the package that
+  would fix it?*
+- **runcheck.py** answers: *what shared libraries/packages does this
+  actually load at runtime - including ones only touched once you exercise
+  a particular code path?*
+
+Every tool imports its package lookup, Contents scanning and table
+rendering from `configcheck.py`, so keep all the files in the same
+directory (they don't need to be in your working directory - just next to
+each other).
+
+The CMake and Meson tools are deliberately separate scripts that only
+*import* `configcheck.py`: they never modify it and share no code with
+each other, so a change or bug in one build system's tools can never affect
+another's.
 
 ## Requirements
 
@@ -34,6 +54,11 @@ other).
 - Debian/Ubuntu (or a derivative) - resolution is built on `dpkg`,
   `apt-cache`, and `ldconfig`
 - `strace`, for `runcheck.py` only (`sudo apt install strace`)
+- The `*-cmake` and `*-meson` tools do **not** need cmake or meson
+  installed (the static tools read the project files themselves; the
+  makecheck tools read the files a configure run left behind). If cmake or
+  meson is installed, its version is shown in the report; otherwise
+  Debian trixie's is assumed.
 - Optional but recommended: a Contents file for your archive (see
   [Package resolution](#package-resolution)) or `apt-file`, for looking
   up a package that isn't installed on this machine at all
@@ -78,6 +103,67 @@ noise, since it's parsing shell syntax specifically.
 | `HAVE` | What version you actually have installed, or could install |
 | `NOTE` | Anything else worth knowing - ambiguous matches, dev-vs-runtime symlink gaps, glibc-builtin functionality with no separate package, etc. |
 
+## configcheck-cmake.py
+
+Reads `CMakeLists.txt` **statically** - cmake is never run. It tokenizes
+the CMake language, follows `include()` / `add_subdirectory()`, expands
+the project's own functions and macros, and evaluates `if()` conditions
+with three outcomes (true / false / depends on a user choice). Branches
+that are definitely off on Linux (`WIN32`, `APPLE`, ...) are dropped;
+checks under an undecided condition are grouped under the `option()` that
+controls them, like configcheck groups by `--enable-x`.
+
+```
+./configcheck-cmake.py /path/to/project            # or .../CMakeLists.txt
+./configcheck-cmake.py /path/to/project --json
+./configcheck-cmake.py /path/to/project -DENABLE_FOO=ON -o report.txt
+```
+
+`find_package(X)` is resolved by reading what X's Find module actually
+looks for (the project's own `FindX.cmake` first, then cmake's built-in
+modules) and mapping that to a `-dev` package; config-file packages fall
+back to `XConfig.cmake`. Rows say which route they used and whether the
+package is `REQUIRED`. Known gaps: `while()` loops are skipped, and
+names built from variables that can't be resolved statically are dropped
+(listed under Notes).
+
+## configcheck-meson.py
+
+Reads `meson.build` **statically** - `meson setup` is not needed. It has its
+own parser and small interpreter for the Meson language: it follows
+`subdir()`, evaluates what it can (Linux, gcc, string/list methods, `if`
+on known values) and keeps anything that depends on a user option or an
+installed package as "unknown", remembering which option it came from -
+so a check under `if get_option('enable_docs')` is listed under
+`-Denable_docs`.
+
+```
+./configcheck-meson.py /path/to/project            # or .../meson.build
+./configcheck-meson.py /path/to/project -Denable_asm=false --json -o report.txt
+```
+
+`dependency('x')` is looked up as `x.pc` (pkg-config), then as an `x-config`
+tool; a few names (`threads`, `dl`, `boost`, `gtest`...) have built-in
+handling. `find_program()`, `cc.find_library()`, `cc.has_header()` and the
+headers named in `cc.compiles()` / `has_function(prefix: ...)` probes are
+reported too. Lookups that only happen when a compile probe fails are
+marked as such. Gaps (shown under Notes): subprojects are noted, not
+followed; names built from unresolvable variables are dropped.
+
+## makecheck-meson.py
+
+Reads a **configured** build directory (`meson setup builddir` first).
+`meson-log.txt` records every dependency, library, program and header lookup
+and its result, so NOT FOUND ones come with the Debian package that would
+fix them. It also lists what `build.ninja` links (with full-path and static
+`.a` linking flagged) and invokes.
+
+```
+./makecheck-meson.py /path/to/builddir
+```
+
+Both Meson tools import only `configcheck.py`.
+
 ## makecheck.py
 
 Parses a Makefile - hand-written, or the one autoconf/automake generates
@@ -117,6 +203,24 @@ nothing left for the Makefile itself to query live, so nothing shows up
 there. A hand-written Makefile with no configure step has to shell out to
 `pkg-config` itself at build time, and that's exactly what this section
 is for.
+
+## makecheck-cmake.py
+
+Reads a **configured** CMake build directory (run `cmake ..` first) and
+reports what the build really uses: libraries linked (from `link.txt` or
+`build.ninja`, including ones linked by full path - system `.a` files are
+flagged as static), programs invoked (compilers, `ar`, `ninja`/`make`...),
+pkg-config modules and `find_library`/`find_path`/package results recorded
+in `CMakeCache.txt` - with **NOT FOUND** ones called out - and include
+paths outside the project. Works with the Unix Makefiles and Ninja
+generators.
+
+```
+./makecheck-cmake.py /path/to/build
+./makecheck-cmake.py /path/to/build --json -o report.txt
+```
+
+Like `configcheck-cmake.py`, it only imports `configcheck.py`.
 
 ## runcheck.py
 
@@ -186,7 +290,7 @@ launch requirement.
 
 ## Package resolution
 
-All three tools share one resolver, tried in order, for anything that
+All the tools share one resolver, tried in order, for anything that
 isn't already installed:
 
 1. **`dpkg -S`** - is it already installed right now
@@ -198,8 +302,8 @@ isn't already installed:
    below). Auto-discovered from `/var/lib/apt/lists`,
    `/var/cache/apt/apt-file`, or `~/.cache/apt-file`; or point it at
    specific files directly with
-   `DEB_BUILDCHECK_CONTENTS_FILE=/path/to/file1:/path/to/file2`. All three
-   tools print which files they found (or that none were found) before
+   `DEB_BUILDCHECK_CONTENTS_FILE=/path/to/file1:/path/to/file2`. Every
+   tool prints which files they found (or that none were found) before
    they start. The files are **streamed**, never loaded: a full Debian
    release's Contents files are ~800MB uncompressed, but they're read in
    1MB pieces and everything a report needs is looked up in a single
@@ -220,6 +324,13 @@ isn't already installed:
    between versions of the same distro)
 4. Otherwise: an honest `?` - never a guess
 
+**Headers** (the CMake and Meson tools) are matched against the compiler's
+default include path first - `/usr/include/<h>`, the multiarch directory and
+the installed gcc's own include directory - so `xxhash.h` doesn't resolve to
+the private copy LLVM happens to ship, and `stdbool.h` names the compiler
+package instead of listing every package that has a file of that name. Only
+if that finds nothing does the looser "any path ending in `/<h>`" search run.
+
 ## Known limitations
 
 - Compiler-property checks (compiler version, executable suffix, and
@@ -238,6 +349,18 @@ isn't already installed:
 - Makefile `-I` include paths are reported with an existence check but
   not package-resolved, since an arbitrary path doesn't map reliably to
   one package
+- The CMake and Meson static tools are interpreters-by-approximation: they
+  assume Linux and gcc, treat anything that depends on a user option or an
+  installed package as "unknown" (and show it under the option that decides
+  it), and skip what can't be known statically - CMake `while()` loops,
+  Meson subprojects and helper-tool modules (gnome, qt, ...), and names
+  built from variables they can't resolve. These are listed under *Notes*
+  in the report. A lookup guarded by a compile/link probe is marked as
+  such, since it can't be decided without running the compiler.
+- The makecheck-cmake / makecheck-meson tools report what the configure run
+  decided, so they need a configured build directory; a package they name
+  for a NOT FOUND entry is inferred from the Find module / dependency name
+  and should be treated as a strong hint, not a guarantee.
 - A pkg-config module referenced only by its macro's variable-prefix
   name (e.g. `PKG_CHECK_MODULES([SNDFILE], ...)`) can show up as a
   separate, unresolved-looking entry alongside the real module it
@@ -245,21 +368,15 @@ isn't already installed:
 
 ## Roadmap
 
-### configcheck (autoconf `configure` scripts)
-- CMake equivalent (parsing `CMakeLists.txt`-style checks -
-  `check_include_file`, `find_package`, etc.)
-- Meson equivalent (parsing `meson.build` checks)
+The suite is **feature complete**: every supported build system (autotools,
+CMake, Meson) has both a static tool and a configured-build tool, plus
+`runcheck.py` for runtime tracing.
 
-### makecheck (Makefiles)
-- CMake equivalent (parsing the generated build files CMake produces)
-- Meson equivalent (parsing the generated Ninja build file)
-
-### runcheck (runtime dependency tracing)
-- Portability beyond Linux x86_64 (currently the initial target
-  platform)
-
-### Planned additions to the suite
-- (none currently)
+Possible future work, none of it required:
+- `runcheck.py` portability beyond Linux x86_64 (currently the initial
+  target platform)
+- Following Meson subprojects and CMake `FetchContent` dependencies
+- Further build systems (e.g. SCons, Bazel) if there is demand
 
 ## License
 
