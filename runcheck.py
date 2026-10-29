@@ -27,7 +27,7 @@ import threading
 import time
 
 try:
-    from configcheck import Column, render_table, get_term_width, _run, HAVE_DPKG, _fix_merged_usr, resolve_package, describe_contents_files
+    from configcheck import Column, render_table, get_term_width, _run, HAVE_DPKG, _fix_merged_usr, resolve_package, describe_contents_files, prefetch_contents
 except ModuleNotFoundError:
     print("error: configcheck.py not found - runcheck.py shares its rendering and",
           file=sys.stderr)
@@ -142,26 +142,73 @@ def parse_strace_log(path: str) -> "tuple[set, set, set]":
     return libraries, programs, failed_basenames
 
 
+# A trace of something like vlc touches hundreds of files, and every
+# `dpkg -S` / `dpkg-query` call re-reads dpkg's whole database (~130ms and
+# ~30ms on a typical install) - one call per file was ~26s of a 32s run.
+# Both commands accept many arguments, and `dpkg -S` prints each path next
+# to its owner, so the whole set is resolved with a handful of calls.
+_DPKG_BATCH = 300                                 # args per call, far below ARG_MAX
+_DPKG_S_LINE_RE = re.compile(r'^(.*?): (/.*)$')   # "pkg[:arch][, pkg...]: /path"
+
+
+def _dpkg_owners(paths: "list[str]") -> "dict[str, str]":
+    """path -> owning package (first one listed), for each path dpkg knows."""
+    owners: "dict[str, str]" = {}
+    wanted = set(paths)
+    for i in range(0, len(paths), _DPKG_BATCH):
+        for line in _run(["dpkg", "-S", *paths[i:i + _DPKG_BATCH]], timeout=60):
+            m = _DPKG_S_LINE_RE.match(line)
+            if m and m.group(2) in wanted:
+                owners.setdefault(m.group(2), m.group(1).split(":", 1)[0])
+    return owners
+
+
+def _package_versions(packages: "set[str]") -> "dict[str, str]":
+    versions: "dict[str, str]" = {}
+    names = sorted(packages)
+    for i in range(0, len(names), _DPKG_BATCH):
+        cmd = ["dpkg-query", "-W", "-f=${Package}\t${Version}\n", *names[i:i + _DPKG_BATCH]]
+        for line in _run(cmd, timeout=60):
+            name, _, version = line.partition("\t")
+            if version.strip():
+                versions.setdefault(name, version.strip())
+    return versions
+
+
+def resolve_paths_to_packages(paths) -> "dict[str, tuple[str, str]]":
+    """path -> (package, version) for exact, already-known-to-exist file
+    paths - same answers as resolving each one separately, in a few calls."""
+    uniq = list(dict.fromkeys(paths))
+    if not HAVE_DPKG:
+        return {p: ("?", "?") for p in uniq}
+
+    fixed = {p: _fix_merged_usr(p) for p in uniq}
+    owners = _dpkg_owners(list(dict.fromkeys(fixed.values())))
+    pkg_of = {p: owners.get(fixed[p]) for p in uniq}
+
+    # some libraries (BLAS/LAPACK being the classic case) are managed
+    # through Debian's update-alternatives system: the traced path is
+    # a symlink (often a two-hop chain through /etc/alternatives/)
+    # that dpkg doesn't track directly - only the real file at the
+    # end of the chain is actually owned by a package
+    retry = {}
+    for p in uniq:
+        if pkg_of[p] is None:
+            real_path = os.path.realpath(p)
+            if real_path != p:
+                retry[p] = _fix_merged_usr(real_path)
+    if retry:
+        owners = _dpkg_owners(list(dict.fromkeys(retry.values())))
+        for p, real in retry.items():
+            pkg_of[p] = owners.get(real)
+
+    versions = _package_versions({pkg for pkg in pkg_of.values() if pkg})
+    return {p: ((pkg_of[p], versions.get(pkg_of[p], "?")) if pkg_of[p] else ("?", "?")) for p in uniq}
+
+
 def resolve_path_to_package(path: str) -> "tuple[str, str]":
     """(package, version) for an exact, already-known-to-exist file path."""
-    if not HAVE_DPKG:
-        return "?", "?"
-    hits = _run(["dpkg", "-S", _fix_merged_usr(path)], timeout=10)
-    if not hits:
-        # some libraries (BLAS/LAPACK being the classic case) are managed
-        # through Debian's update-alternatives system: the traced path is
-        # a symlink (often a two-hop chain through /etc/alternatives/)
-        # that dpkg doesn't track directly - only the real file at the
-        # end of the chain is actually owned by a package
-        real_path = os.path.realpath(path)
-        if real_path != path:
-            hits = _run(["dpkg", "-S", _fix_merged_usr(real_path)], timeout=10)
-    if not hits:
-        return "?", "?"
-    pkg = hits[0].split(":", 1)[0]
-    ver_hits = _run(["dpkg-query", "-W", "-f=${Version}", pkg], timeout=10)
-    version = ver_hits[0].strip() if ver_hits and ver_hits[0].strip() else "?"
-    return pkg, version
+    return resolve_paths_to_packages([path])[path]
 
 
 def tail_and_announce(log_path: str, stop_event: threading.Event, seen: set, lock: threading.Lock) -> None:
@@ -192,13 +239,15 @@ def tail_and_announce(log_path: str, stop_event: threading.Event, seen: set, loc
 
 
 def build_summary(libraries: set, programs: set, failed_basenames: set) -> dict:
-    lib_rows = [dict(zip(("path", "package", "version"), (path, *resolve_path_to_package(path))))
+    owners = resolve_paths_to_packages(sorted(libraries | programs))
+    lib_rows = [dict(zip(("path", "package", "version"), (path, *owners[path])))
                 for path in sorted(libraries)]
-    prog_rows = [dict(zip(("path", "package", "version"), (path, *resolve_path_to_package(path))))
+    prog_rows = [dict(zip(("path", "package", "version"), (path, *owners[path])))
                  for path in sorted(programs)]
 
     opened_basenames = {os.path.basename(p) for p in libraries}
     missing_basenames = sorted(failed_basenames - opened_basenames)
+    prefetch_contents(missing_basenames)   # one Contents pass for all of them
     missing_rows = []
     for name in missing_basenames:
         pkg, installed, note = resolve_package(name, exact=False)

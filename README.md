@@ -200,7 +200,18 @@ isn't already installed:
    specific files directly with
    `DEB_BUILDCHECK_CONTENTS_FILE=/path/to/file1:/path/to/file2`. All three
    tools print which files they found (or that none were found) before
-   they start
+   they start. The files are **streamed**, never loaded: a full Debian
+   release's Contents files are ~800MB uncompressed, but they're read in
+   1MB pieces and everything a report needs is looked up in a single
+   pass, so memory use stays at a few tens of MB and a typical run spends
+   only a couple of seconds here. If you've enabled a foreign
+   architecture (e.g. `i386` for wine on an `amd64` system), its
+   `Contents-i386` file is picked up automatically; packages found *only*
+   there (`lib64ncurses-dev` and the like - things you can't install on
+   your own architecture) are set aside whenever a native match exists,
+   so they don't show up as false "ambiguous" candidates. (`.lz4` files are decompressed by
+   dynamically loading the system's own `liblz4.so.1` - nothing is
+   bundled.)
 3. **`apt-file search`**, if installed - a last-resort fallback; in
    practice the Contents-file tier above already covers the same ground
    `apt-file` itself reads from, and more portably (`apt-file` is a

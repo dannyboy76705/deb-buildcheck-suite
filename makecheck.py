@@ -24,6 +24,7 @@ try:
         Column, render_table, get_term_width,
         resolve_program, resolve_library, resolve_package, HAVE_APTFILE,
         Check, VersionReq, MODVER_TOKEN_RE, have_cell, describe_contents_files,
+        prefetch_contents, contents_term_for_library,
     )
 except ModuleNotFoundError:
     print("error: configcheck.py not found - makecheck.py shares its package/program/library",
@@ -405,6 +406,15 @@ def build_report(makefile_path: str) -> dict:
     # version - so it needs adding here or it wouldn't be reported as a
     # dependency at all, requirement or not
     programs |= version_reqs.keys()
+
+    # look up everything this Makefile needs from the Contents files in one
+    # pass rather than one pass per item (a program is only searched for if
+    # it isn't already on this machine, same as resolve_program)
+    prefetch_contents(
+        [t for t in map(contents_term_for_library, libs) if t]
+        + [f"bin/{prog}" for prog in sorted(programs) if not shutil.which(prog)]
+        + [f"{mod}.pc" for mod in modules]
+    )
 
     library_rows = []
     for lib in libs:

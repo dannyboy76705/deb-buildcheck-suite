@@ -15,7 +15,6 @@ import bisect
 import contextlib
 import ctypes
 import gzip
-import io
 import json
 import os
 import re
@@ -23,8 +22,51 @@ import shlex
 import shutil
 import subprocess
 import sys
+import zlib
 from dataclasses import dataclass, field
 from functools import lru_cache
+
+
+# ---------------------------------------------------------------------------
+# Opt-in diagnostics: DEB_BUILDCHECK_TIMING=1 prints, on exit, how many times
+# each external command ran and how long it took in total - the quick way to
+# see where a slow run is actually spending its time (a configure script can
+# trigger hundreds of dpkg/apt-cache/--version calls). Off by default and has
+# no effect on results.
+# ---------------------------------------------------------------------------
+if os.environ.get("DEB_BUILDCHECK_TIMING"):
+    import atexit
+    import time as _time
+
+    _CMD_TIMES: "dict[str, list]" = {}
+    _real_subprocess_run = subprocess.run
+
+    def _timed_run(cmd, *args, **kwargs):
+        start = _time.monotonic()
+        try:
+            return _real_subprocess_run(cmd, *args, **kwargs)
+        finally:
+            elapsed = _time.monotonic() - start
+            argv = list(cmd) if isinstance(cmd, (list, tuple)) else [str(cmd)]
+            key = os.path.basename(argv[0])
+            if key == "dpkg" and len(argv) > 2 and argv[1] == "-S":
+                key += " -S (glob)" if "*" in argv[2] else " -S (exact path)"
+            elif len(argv) > 1 and argv[1].startswith("-"):
+                key += " " + argv[1]
+            elif len(argv) > 1 and key in ("apt-cache", "apt-file"):
+                key += " " + argv[1]
+            entry = _CMD_TIMES.setdefault(key, [0, 0.0])
+            entry[0] += 1
+            entry[1] += elapsed
+
+    subprocess.run = _timed_run
+
+    @atexit.register
+    def _print_command_timing() -> None:
+        total = sum(t for _, t in _CMD_TIMES.values())
+        print(f"\nexternal command time: {total:.1f}s total", file=sys.stderr)
+        for key, (n, t) in sorted(_CMD_TIMES.items(), key=lambda kv: -kv[1][1]):
+            print(f"  {key:34s} {n:5d} calls  {t:7.1f}s  ({t / n * 1000:.0f} ms each)", file=sys.stderr)
 
 
 @dataclass
@@ -835,61 +877,215 @@ def _lz4_lib():
     return _LZ4 or None
 
 
-def _lz4_decompress_bytes(path: str) -> bytes:
+_LZ4_READ_SIZE = 1 << 18     # compressed bytes fed to liblz4 per read
+_LZ4_OUT_SIZE = 1 << 20      # decompressed bytes produced per call
+_BLOCK_READ_SIZE = 1 << 20   # bytes per read for gzip/plain Contents files
+
+
+def _lz4_stream_chunks(path: str):
+    """Yield a LZ4-framed file's decompressed content in ~1MB pieces.
+
+    Streaming matters here: the Debian main Contents-all file alone is
+    ~590MB decompressed, and the whole set for one release is ~800MB.
+    The previous approach decompressed each file into one bytes object and
+    then turned every line into a Python str that stayed alive for the
+    life of the process - well over a gigabyte of resident memory for a
+    lookup table that only ever answers "which package ships file X". Here
+    only the current input chunk and one 1MB output buffer exist at a time
+    (~20MB peak RSS regardless of how large the Contents files are)."""
     lib = _lz4_lib()
     if lib is None:
         raise RuntimeError("liblz4.so.1 not available")
     ctx = ctypes.c_void_p()
     if lib.LZ4F_isError(lib.LZ4F_createDecompressionContext(ctypes.byref(ctx), 100)):
         raise RuntimeError("failed to create LZ4 decompression context")
-    out_chunks = []
+    out_buf = ctypes.create_string_buffer(_LZ4_OUT_SIZE)
+    frame_done = True    # nothing in flight yet; flips False mid-frame
     try:
         with open(path, "rb") as f:
-            data = f.read()
-        src_buf = ctypes.create_string_buffer(data, len(data))
-        src_off = 0
-        out_chunk_size = 1 << 20
-        out_buf = ctypes.create_string_buffer(out_chunk_size)
-        while src_off < len(data):
-            src_remaining = ctypes.c_size_t(len(data) - src_off)
-            dst_size = ctypes.c_size_t(out_chunk_size)
-            src_ptr = ctypes.cast(ctypes.addressof(src_buf) + src_off, ctypes.c_void_p)
-            result = lib.LZ4F_decompress(ctx, out_buf, ctypes.byref(dst_size),
-                                          src_ptr, ctypes.byref(src_remaining), None)
-            if lib.LZ4F_isError(result):
-                raise RuntimeError("LZ4F_decompress failed")
-            if dst_size.value:
-                out_chunks.append(out_buf.raw[:dst_size.value])
-            src_off += src_remaining.value
-            if result == 0 or (src_remaining.value == 0 and dst_size.value == 0):
-                break
+            while True:
+                chunk = f.read(_LZ4_READ_SIZE)
+                if not chunk:
+                    break
+                src_buf = ctypes.create_string_buffer(chunk, len(chunk))
+                src_base = ctypes.addressof(src_buf)
+                src_off = 0
+                while src_off < len(chunk):
+                    src_size = ctypes.c_size_t(len(chunk) - src_off)
+                    dst_size = ctypes.c_size_t(_LZ4_OUT_SIZE)
+                    result = lib.LZ4F_decompress(ctx, out_buf, ctypes.byref(dst_size),
+                                                  ctypes.c_void_p(src_base + src_off),
+                                                  ctypes.byref(src_size), None)
+                    if lib.LZ4F_isError(result):
+                        raise RuntimeError("LZ4F_decompress failed (corrupt or unsupported LZ4 data)")
+                    if src_size.value == 0 and dst_size.value == 0:
+                        raise RuntimeError("LZ4F_decompress made no progress")
+                    src_off += src_size.value
+                    frame_done = (result == 0)   # 0 = a complete frame has been fully decoded
+                    if dst_size.value:
+                        yield ctypes.string_at(out_buf, dst_size.value)
+        if not frame_done:
+            raise RuntimeError("truncated LZ4 file (ends mid-frame)")
     finally:
         lib.LZ4F_freeDecompressionContext(ctx)
-    return b"".join(out_chunks)
 
 
-def _open_contents_file(path: str):
-    """Text-mode file-like object regardless of whether the Contents file
-    is plain text, gzip-compressed (classic apt-file), or lz4-compressed
-    (apt's own default since Debian ~bullseye/Trixie)."""
-    if path.endswith(".gz"):
-        return gzip.open(path, "rt", errors="replace")
+def _raw_contents_chunks(path: str):
+    """Decompressed bytes of a Contents file in arbitrary-sized pieces,
+    whether it is plain text, gzip-compressed (classic apt-file), or
+    lz4-compressed (apt's own default since Debian ~bullseye/Trixie)."""
     if path.endswith(".lz4"):
-        return io.TextIOWrapper(io.BytesIO(_lz4_decompress_bytes(path)), errors="replace")
-    return open(path, "r", errors="replace")
+        yield from _lz4_stream_chunks(path)
+        return
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rb") as f:
+        while True:
+            chunk = f.read(_BLOCK_READ_SIZE)
+            if not chunk:
+                break
+            yield chunk
 
 
-@lru_cache(maxsize=None)
-def _read_contents_lines(path: str) -> tuple:
-    """Decompressing a 170+MB Contents file is the expensive part - cache
-    the decompressed lines once per file so a report with dozens of
-    distinct unresolved checks only pays that cost on the first lookup,
-    not on every single one."""
-    try:
-        with _open_contents_file(path) as f:
-            return tuple(line.rstrip("\n") for line in f if line.strip())
-    except (OSError, RuntimeError):
-        return ()
+def _iter_contents_blocks(path: str):
+    """Yield the file as blocks of COMPLETE lines (each block ends on a
+    newline), so a caller never has to deal with a line split across two
+    reads."""
+    tail = b""
+    for chunk in _raw_contents_chunks(path):
+        data = tail + chunk if tail else chunk
+        cut = data.rfind(b"\n")
+        if cut < 0:
+            tail = data
+            continue
+        tail = data[cut + 1:]
+        yield data[:cut + 1]
+    if tail.strip():
+        yield tail + b"\n"
+
+
+# (term, exact) -> sorted tuple of package names, for every term already
+# scanned for. This is the ONLY thing kept in memory from the Contents
+# files - a few bytes per distinct term, not the files' contents.
+_CONTENTS_CACHE: "dict[tuple[str, bool], tuple[str, ...]]" = {}
+
+
+_CONTENTS_ARCH_RE = re.compile(r'contents-([a-z0-9]+)(?:\.|$)', re.IGNORECASE)
+
+
+@lru_cache(maxsize=1)
+def _native_arch() -> "str | None":
+    out = _run(["dpkg", "--print-architecture"], timeout=5) if HAVE_DPKG else []
+    return out[0].strip() if out else None
+
+
+def _is_foreign_contents_file(path: str) -> bool:
+    """True for a Contents file of a different CPU architecture than this
+    machine's (e.g. Contents-i386 on an amd64 system with 32-bit multiarch
+    enabled). 'Contents-all' and anything whose name doesn't say are never
+    foreign. Foreign files list packages that only exist in that other
+    architecture's archive - lib64ncurses-dev, binutils-x86-64-linux-gnu,
+    libc6-dev-amd64 on i386 - which can't be installed here and would
+    otherwise show up as false 'ambiguous' candidates. Their ordinary
+    packages (libncurses-dev, ...) have the SAME name as the native ones,
+    so nothing real is lost by setting the foreign-only names aside."""
+    m = _CONTENTS_ARCH_RE.search(os.path.basename(path))
+    native = _native_arch()
+    return bool(m and native and m.group(1).lower() not in (native.lower(), "all"))
+
+
+def _packages_in(pkg_field: bytes) -> "set[str]":
+    """'section/pkg,section/pkg' -> {'pkg', ...}"""
+    pkgs = set()
+    for entry in pkg_field.decode("utf-8", errors="replace").split(","):
+        pkg = entry.rsplit("/", 1)[-1]
+        if pkg:
+            pkgs.add(pkg)
+    return pkgs
+
+
+def _scan_contents(keys: "list[tuple[str, bool]]") -> None:
+    """Resolve every (term, exact) key in `keys` against every Contents
+    file in ONE streaming pass, and record each result in _CONTENTS_CACHE.
+
+    The matching rules are exactly the ones the old per-term regex used:
+    non-exact = the path ends in '/' + term (term is the final path
+    component, or a trailing run of components like 'bin/gcc'); exact =
+    the path ends in term. What changed is only how lines are found. The
+    final path component is looked up in a dict built from the wanted
+    terms, so a line costs one rsplit + one rpartition + one dict probe
+    no matter how many terms are being searched for - a pass over all of
+    Debian's Contents files (~8M lines) takes a couple of seconds
+    whether it's resolving 1 term or 200. The suffix check afterwards is
+    what makes a basename hit a real match."""
+    # hits from this machine's own architecture (and Contents-all), kept
+    # apart from hits seen only in a foreign architecture's file - see
+    # _is_foreign_contents_file for why
+    native_found: "dict[tuple[str, bool], set]" = {k: set() for k in keys}
+    foreign_found: "dict[tuple[str, bool], set]" = {k: set() for k in keys}
+
+    loose: "dict[bytes, list[tuple[tuple[str, bool], bytes]]]" = {}   # final component -> [(key, '/'+term)]
+    exact_suffixes: "dict[bytes, list[tuple[str, bool]]]" = {}       # term -> [key]
+    for key in keys:
+        term, exact = key
+        raw = term.encode("utf-8", errors="replace")
+        if exact:
+            exact_suffixes.setdefault(raw, []).append(key)
+        else:
+            loose.setdefault(raw.rpartition(b"/")[2], []).append((key, b"/" + raw))
+    exact_tuple = tuple(exact_suffixes)   # bytes.endswith() takes a tuple, tested in C
+
+    for path in _contents_files():
+        found = foreign_found if _is_foreign_contents_file(path) else native_found
+        try:
+            for block in _iter_contents_blocks(path):
+                for line in block.split(b"\n"):
+                    parts = line.rsplit(None, 1)
+                    if len(parts) != 2:
+                        continue
+                    file_path, pkg_field = parts
+                    hits = loose.get(file_path.rpartition(b"/")[2])
+                    if hits:
+                        for key, suffix in hits:
+                            if file_path.endswith(suffix):
+                                found[key] |= _packages_in(pkg_field)
+                    if exact_tuple and file_path.endswith(exact_tuple):
+                        for suffix, ekeys in exact_suffixes.items():
+                            if file_path.endswith(suffix):
+                                for key in ekeys:
+                                    found[key] |= _packages_in(pkg_field)
+        except (OSError, RuntimeError, EOFError, zlib.error) as e:
+            # whatever was read before the problem is still valid, so keep
+            # it, but say so - silently treating a damaged download as
+            # "no matches" would look exactly like a genuinely missing package
+            print(f"warning: couldn't read all of Contents file {path}: {e}", file=sys.stderr)
+
+    for key in keys:
+        # foreign-architecture names only count when nothing native matched
+        _CONTENTS_CACHE[key] = tuple(sorted(native_found[key] or foreign_found[key]))
+
+
+def prefetch_contents(terms, exact: bool = False) -> None:
+    """Look up many search terms in a single pass over the Contents files.
+
+    Optional, but it is what makes a report fast: without it each
+    not-yet-seen term triggers its own pass (still low-memory, just
+    repeated - a couple of seconds each on the full Debian set). A caller
+    that knows its terms up front - all the checks of a configure script,
+    all the libraries of a Makefile - calls this once before resolving
+    them one by one. Passing extra terms is harmless; terms that dpkg
+    already answers locally are skipped, since resolve_package would never
+    consult the Contents files for them."""
+    if not _contents_files():
+        return
+    wanted = []
+    for term in dict.fromkeys(terms):    # de-duplicated, order kept
+        if not term or (term, exact) in _CONTENTS_CACHE:
+            continue
+        if _local_package_lookup(term, exact):
+            continue
+        wanted.append((term, exact))
+    if wanted:
+        _scan_contents(wanted)
 
 
 def search_contents_files(term: str, exact: bool) -> list:
@@ -899,27 +1095,12 @@ def search_contents_files(term: str, exact: bool) -> list:
     matches the path ending in exactly `term`; non-exact matches `term`
     as the final path component (preceded by a '/'), same as the
     apt-file CLI tier below."""
-    files = _contents_files()
-    if not files:
+    if not _contents_files():
         return []
-
-    pattern = re.compile(re.escape(term) + r'$') if exact else re.compile(r'/' + re.escape(term) + r'$')
-    packages: set = set()
-
-    for path in files:
-        for line in _read_contents_lines(path):
-            parts = line.rsplit(None, 1)
-            if len(parts) != 2:
-                continue
-            file_path, pkg_field = parts
-            if not pattern.search(file_path):
-                continue
-            for entry in pkg_field.split(","):
-                pkg = entry.rsplit("/", 1)[-1]
-                if pkg:
-                    packages.add(pkg)
-
-    return sorted(packages)
+    key = (term, exact)
+    if key not in _CONTENTS_CACHE:
+        _scan_contents([key])
+    return list(_CONTENTS_CACHE[key])
 
 
 def describe_contents_files() -> str:
@@ -934,8 +1115,25 @@ def describe_contents_files() -> str:
                  "/var/lib/apt/lists, /var/cache/apt/apt-file, ~/.cache/apt-file) - "
                  "lookups for anything not already installed will rely on 'apt-file "
                  "search' if it's installed, or show '?' otherwise.")
-    listing = "\n".join(f"  {p}" for p in files)
+    listing = "\n".join(
+        f"  {p}" + ("   [foreign architecture - only used when nothing native matches]"
+                    if _is_foreign_contents_file(p) else "")
+        for p in files)
     return f"Using {len(files)} Contents file(s) for package lookup:\n{listing}"
+
+
+@lru_cache(maxsize=None)
+def _local_package_lookup(term: str, exact: bool) -> tuple:
+    """Tier 1 of resolve_package: packages that already OWN a matching
+    file on this machine, per `dpkg -S`. Split out and cached so that
+    prefetch_contents() can ask the same question ("does the local dpkg
+    database already answer this?") before deciding what needs a Contents
+    scan, without the later resolve_package call repeating the subprocess."""
+    if not HAVE_DPKG:
+        return ()
+    dpkg_pattern = term if exact else f"*/{term}"
+    hits = _run(["dpkg", "-S", dpkg_pattern], timeout=10)
+    return tuple(sorted({h.split(":", 1)[0] for h in hits}))
 
 
 @lru_cache(maxsize=None)
@@ -943,11 +1141,9 @@ def resolve_package(term: str | None, exact: bool = False) -> tuple[str, str, st
     if not term:
         return ("-", "unknown", "not a file-based check")
 
-    dpkg_pattern = term if exact else f"*/{term}"
     if HAVE_DPKG:
-        hits = _run(["dpkg", "-S", dpkg_pattern], timeout=10)
-        if hits:
-            pkgs = sorted({h.split(":", 1)[0] for h in hits})
+        pkgs = list(_local_package_lookup(term, exact))
+        if pkgs:
             if len(pkgs) > 1 and not exact:
                 # dpkg -S's ordering isn't meaningful - it's whatever order
                 # the local database happens to return, not which package
@@ -973,7 +1169,13 @@ def resolve_package(term: str | None, exact: bool = False) -> tuple[str, str, st
             note = ""
         return (pkg, "no", note)
 
-    if HAVE_APTFILE:
+    # apt-file is only a stand-in for when there are no Contents files to
+    # read directly. If we DID just search them and found nothing, asking
+    # apt-file means searching the same data again (apt-file reads the same
+    # Contents indexes) - and it's slow, ~9s per call, which for a typical
+    # configure script's handful of genuinely-nonexistent names (e.g.
+    # minix/config.h) was ~75s of an otherwise few-second run.
+    if HAVE_APTFILE and not _contents_files():
         pattern = f"{term}$" if exact else f"/{term}$"
         hits = _run(["apt-file", "search", "-x", pattern], timeout=30)
         if hits:
@@ -1080,6 +1282,37 @@ def _libc_provides_symbol(symbol: str) -> bool:
         if pattern.search(line.strip()):
             return True
     return False
+
+
+@lru_cache(maxsize=1)
+def _ldconfig_names() -> frozenset:
+    """Every library name the dynamic linker knows about (`ldconfig -p`),
+    fetched once. resolve_library does its own live lookup; this is only
+    for contents_term_for_library's cheap "is it even worth searching?"."""
+    names = set()
+    if LDCONFIG_PATH:
+        for line in _run([LDCONFIG_PATH, "-p"], timeout=10):
+            if "=>" in line:
+                tokens = line.split("=>", 1)[0].split()
+                if tokens:
+                    names.add(tokens[0])
+    return frozenset(names)
+
+
+def contents_term_for_library(libname: str) -> "str | None":
+    """The Contents search term resolve_library(libname) would fall back to
+    ('libfoo.so'), or None when it can answer from this machine alone (the
+    linker already knows the library, or it's glibc-builtin) - so batch
+    prefetching never spends a glob-style `dpkg -S` on a library the
+    original lookup resolved with a cheap exact-path query."""
+    soname = f"lib{libname}.so"
+    names = _ldconfig_names()
+    if soname in names or any(n.startswith(soname + ".") for n in names):
+        return None
+    symbol = GLIBC_BUILTIN_LIBS.get(libname)
+    if symbol and _libc_provides_symbol(symbol):
+        return None
+    return soname
 
 
 def resolve_library(libname: str) -> tuple[str, str, str]:
@@ -1267,6 +1500,47 @@ NOT_A_PROGRAM = {"sysroot", "objdir", "inline"}
 NOT_ON_LINUX = {"dumpbin", "mt", "nmedit", "lipo", "otool", "otool64"}
 
 
+def contents_terms_for(checks: list[Check]) -> list[str]:
+    """The search terms resolve_all() MAY end up sending to the Contents
+    tier for these checks, so they can be looked up together in a single
+    pass (prefetch_contents) instead of one pass each. Deliberately a
+    superset - it mirrors the term each branch of resolve_all would hand
+    to resolve_package, skipping programs/libraries the machine already
+    has (the cheap checks resolve_all itself starts with); prefetch_contents
+    additionally drops anything `dpkg -S` answers. An extra term in a batch
+    costs next to nothing, so a rare over-inclusion is harmless."""
+    terms: list[str] = []
+    for c in checks:
+        if c.type == "generic":
+            if c.name in NOT_A_PROGRAM or c.name in NOT_ON_LINUX:
+                continue
+            if c.candidates:
+                names = c.candidates
+            elif PLAIN_TOKEN_RE.match(c.name):
+                names = (c.name,)
+            else:
+                continue
+            # resolve_program only reaches the Contents tier when none of
+            # the candidates exists on this machine, and then uses the first
+            if not any(shutil.which(n) for n in names):
+                terms.append(f"bin/{names[0]}")
+        elif c.type == "library":
+            term = contents_term_for_library(c.name.rsplit(" in -l", 1)[-1])
+            if term:
+                terms.append(term)
+        elif c.type == "pkgconfig":
+            terms.append(f"{c.name}.pc")
+        else:
+            term = search_term_for(c)
+            if term:
+                terms.append(term)
+    return terms
+
+
+def prefetch_report_contents(options: list[Option], mandatory: list[Check]) -> None:
+    prefetch_contents(contents_terms_for(mandatory + [c for opt in options for c in opt.checks]))
+
+
 def resolve_all(checks: list[Check]) -> list[dict]:
     results = []
     for c in checks:
@@ -1392,6 +1666,7 @@ def render_table(columns: list[Column], rows: list[dict], sep: str = "  ", width
 
 def print_report(options: list[Option], mandatory: list[Check], configure_path: str, width: int | None = None) -> None:
     term_width = width if width is not None else get_term_width()
+    prefetch_report_contents(options, mandatory)
     print("=" * min(78, term_width))
     print(f" Mandatory checks  (performed unconditionally by {configure_path})")
     print("=" * min(78, term_width))
@@ -1448,6 +1723,7 @@ def print_report(options: list[Option], mandatory: list[Check], configure_path: 
 
 
 def to_json(options: list[Option], mandatory: list[Check]) -> str:
+    prefetch_report_contents(options, mandatory)
     return json.dumps({
         "mandatory": resolve_all(mandatory),
         "optional": [
